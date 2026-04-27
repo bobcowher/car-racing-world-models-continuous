@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from torch.utils.tensorboard.writer import SummaryWriter
 import datetime
 import random
-from models.perceptual_loss import PerceptualLoss
 
 def get_wm_q_ratio(episode):
     """Dynamic world model to Q-model training ratio based on episode.
@@ -85,8 +84,6 @@ class Agent:
         self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=0.0001)
 
         self.world_model_batch_size = world_model_batch_size
-
-        self.next_frame_loss = PerceptualLoss().to(self.device)
 
         self.q_model = QModel(action_dim=self.env.action_space.n, hidden_dim=256, embed_dim=self.world_model.embed_dim).to(self.device)
         self.target_q_model = QModel(action_dim=self.env.action_space.n, hidden_dim=256, embed_dim=self.world_model.embed_dim).to(self.device)
@@ -348,42 +345,6 @@ class Agent:
         # Save comparison image
         display_stacked_obs(viz_pairs, filename, num_frames=1)
         print(f"Saved reconstruction comparison to {filename}")
-
-    def evaluate_rollout(self, num_steps=8, filename="eval_rollout.png"):
-        """Evaluate world model rollout quality over multiple steps.
-
-        Args:
-            num_steps: Number of rollout steps to visualize
-            filename: Output image path
-        """
-        if not self.memory.can_sample(1):
-            return
-
-        # Sample a starting observation
-        obs, _, _, _, _ = self.memory.sample_buffer(1)
-        obs = self.normalize_observation(obs)  # [1, 3, 128, 128]
-
-        rollout_frames = [("step_0_real", obs.cpu())]
-        current_obs = obs
-
-        with torch.no_grad():
-            for step in range(1, num_steps + 1):
-                # Use Q model to select action in latent space
-                embed = self.world_model.encode(current_obs).squeeze(1)  # (1, embed_dim)
-                action_idx = self.q_model(embed).argmax(dim=1)
-                action_onehot = F.one_hot(action_idx, num_classes=self.env.action_space.n).float()
-
-                # Predict next observation using the selected action
-                pred_next_obs, _, _, _, _ = self.world_model.forward(current_obs, action_onehot)
-
-                # Store the predicted observation
-                rollout_frames.append((f"step_{step}_pred", pred_next_obs.cpu()))
-
-                # Use predicted observation as input for next step
-                current_obs = pred_next_obs
-
-        # Visualize all rollout steps (show only last frame of each 4-frame stack)
-        display_stacked_obs(rollout_frames, filename, num_frames=1)
 
     def save(self):
         self.world_model.save_the_model("world_model", verbose=True)
