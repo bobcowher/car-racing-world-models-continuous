@@ -1,12 +1,7 @@
 from agent import Agent
 import gymnasium as gym
-import ale_py
-from life_penalty_wrapper import LifePenaltyWrapper
 
-gym.register_envs(ale_py)
-
-env = gym.make("ALE/Breakout-v5", render_mode="rgb_array")
-env = LifePenaltyWrapper(env, penalty=-1.0)
+env = gym.make("CarRacing-v3", continuous=False, render_mode="human")
 
 agent = Agent(env=env)
 
