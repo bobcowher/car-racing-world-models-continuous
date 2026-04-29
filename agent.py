@@ -17,12 +17,14 @@ def get_wm_q_ratio(episode):
     Keeps world model training strong throughout to track evolving data distribution.
     Never drops below 400 WM updates/episode to prevent WM degradation.
     """
-    if episode < 200:
-        return [4, 1]   # WM-heavy + Q on real data only
+    if episode < 20:
+        return [4, 0]   # WM-only: build initial foundation
+    elif episode < 200:
+        return [4, 1]   # WM-heavy
     elif episode < 400:
-        return [2, 2]   # Balanced: Q switches to imagination
+        return [2, 2]   # Balanced
     else:
-        return [2, 3]   # Q-focused but WM stays strong
+        return [2, 3]   # Q-focused
 
 
 class MixedSampler:
