@@ -96,10 +96,6 @@ class Agent:
         self.min_epsilon = 0.1
         self.epsilon_decay = 0.98
 
-        self.imagine_epsilon = 1
-        self.imagine_min_epsilon = 0.1
-        self.imagine_epsilon_decay = 0.99
-
         self.total_steps = 0
     
     def normalize_observation(self, obs):
@@ -156,10 +152,7 @@ class Agent:
                 q_vals = self.q_model(current_embeds) # (batch_size, n_actions)
                 best_actions = q_vals.argmax(dim=1)   # (batch_size,)
                 
-                # Apply epsilon-greedy across the batch
-                random_actions = torch.randint(0, self.env.action_space.n, (batch_size,), device=self.device)
-                exploring_mask = (torch.rand(batch_size, device=self.device) < self.imagine_epsilon).long()
-                action_idx = exploring_mask * random_actions + (1 - exploring_mask) * best_actions
+                action_idx = best_actions
                 
                 action_onehot = F.one_hot(action_idx, num_classes=self.env.action_space.n).float()
 
@@ -419,7 +412,6 @@ class Agent:
 
             # Adjust epsilon.
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-            self.imagine_epsilon = max(self.imagine_min_epsilon, self.imagine_epsilon * self.imagine_epsilon_decay)
 
             # Log stats for the current training iteration 
             print(f"Episode {episode} | reward: {episode_reward:.1f} | epsilon: {self.epsilon:.3f} | steps: {episode_steps}")
