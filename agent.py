@@ -34,7 +34,7 @@ class MixedSampler:
         with torch.no_grad():
             states      = agent.world_model.encode(agent.normalize_observation(obs)).squeeze(1)
             next_states = agent.world_model.encode(agent.normalize_observation(next_obs)).squeeze(1)
-        rewards = rewards / 100.0  # match imagined reward scale (reward head trained with /100 targets)
+        rewards = rewards.float()
         return states, actions, rewards, next_states, dones
 
     def _sample_imagined(self, batch_size, horizon):
@@ -370,7 +370,7 @@ class Agent:
 
         rollout_steps = imagination_steps if imagination_steps is not None else batch_size
 
-        run_tag = f'world_model_biased_explore'
+        run_tag = f'world_model_raw_reward_scale'
         summary_writer_name = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{run_tag}'
 
         writer = SummaryWriter(summary_writer_name)

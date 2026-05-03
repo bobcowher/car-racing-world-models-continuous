@@ -134,7 +134,7 @@ class WorldModel(BaseModel):
         dynamics_loss = F.mse_loss(next_embed_pred, next_embed_target.detach())
 
         # === 3. Reward Loss ===
-        reward_loss = F.mse_loss(reward_pred.squeeze(-1), rewards.float() / 100.0)
+        reward_loss = F.mse_loss(reward_pred.squeeze(-1), rewards.float())
 
         # === 4. Done Loss ===
         # Binary classification
