@@ -366,7 +366,7 @@ class Agent:
         self.q_model.train()
         return total_rewards
 
-    def train(self, episodes=1, offline_training_epochs=1, batch_size=1, num_batches=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5):
+    def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5):
 
         rollout_steps = imagination_steps if imagination_steps is not None else batch_size
 
