@@ -1,20 +1,18 @@
 import sys
 import os
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")  # prevent Qt thread-affinity warnings from ALE threads
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")  # prevent Qt thread-affinity warnings
 import torch
 import torch.nn.functional as F
 import numpy as np
 import cv2
-import ale_py
 import gymnasium as gym
-from life_penalty_wrapper import LifePenaltyWrapper
 from agent import Agent
 
 
-SCALE     = 5   # display scale factor (96 → 480)
-FPS       = 1   # playback speed (1 second per frame)
-GAP       = 4   # pixel gap between real and imagined panels
-MAX_STEPS = 32  # extended rollout for reward correlation analysis
+SCALE     = 5    # display scale factor (96 → 480)
+FPS       = 1    # playback speed (1 second per frame)
+GAP       = 4    # pixel gap between real and imagined panels
+MAX_STEPS = 200  # steps per rollout
 
 
 def embed_to_frame(embed, world_model):
@@ -61,9 +59,7 @@ def make_display(real_frame, imag_frame, step, real_reward, imag_reward):
 def main():
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-    gym.register_envs(ale_py)
-    env = gym.make("ALE/Breakout-v5", render_mode="rgb_array")
-    env = LifePenaltyWrapper(env, penalty=-1.0)
+    env = gym.make("CarRacing-v3", continuous=False, render_mode="rgb_array")
 
     agent = Agent(env=env)
 
@@ -81,9 +77,8 @@ def main():
 
     def get_initial_embed():
         obs, _ = env.reset()
-        for i in range(30):
-            action = 1 if i == 0 else env.action_space.sample()
-            obs, _, term, trunc, _ = env.step(action)
+        for _ in range(50):
+            obs, _, term, trunc, _ = env.step(env.action_space.sample())
             if term or trunc:
                 obs, _ = env.reset()
         obs_tensor = agent.process_observation(obs)
