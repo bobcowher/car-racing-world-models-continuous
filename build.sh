@@ -4,6 +4,6 @@ conda env list | grep -q "^car-racing " || conda create -n car-racing python=3.1
 
 conda activate car-racing
 
-pip install -r requirements.txt
+#pip install -r requirements.txt
 
 python -u ./train.py

@@ -2,10 +2,11 @@ import os
 import gymnasium as gym
 import torch
 from buffer import ReplayBuffer
-from utils import display_stacked_obs
+from utils import hard_update
 from models.world_model import WorldModel
 from models.actor import Actor
 from models.critic import Critic
+from torch.optim import Adam
 import cv2
 import torch.nn.functional as F
 from torch.utils.tensorboard.writer import SummaryWriter
@@ -50,6 +51,7 @@ class Agent:
                        target_update_interval = 10000) -> None:
         self.env = env
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        self.learning_rate = 0.0001
 
         os.makedirs("checkpoints", exist_ok=True)
         os.makedirs("runs", exist_ok=True)
@@ -58,20 +60,46 @@ class Agent:
 
         obs = self.process_observation(obs)
 
+        assert self.env.action_space.shape is not None # Gets rid of pyright warnings
+        self.n_actions = self.env.action_space.shape[0] # 3
+        self.ac_hidden_size = 512
+
         self.memory = ReplayBuffer(max_size=max_buffer_size, input_shape=obs.shape, input_device=self.device, output_device=self.device)
 
-        self.world_model = WorldModel(observation_shape=obs.shape, embed_dim=1024, n_actions=self.env.action_space.n).to(self.device)
+        self.world_model = WorldModel(observation_shape=obs.shape, embed_dim=1024, n_actions=self.n_actions).to(self.device)
 
         print(f"Observation shape: {obs.shape}")
 
-        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=0.0001)
+        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=self.learning_rate)
 
         self.world_model_batch_size = world_model_batch_size
 
-        self.q_model = QModel(action_dim=self.env.action_space.n, hidden_dim=256, embed_dim=self.world_model.embed_dim).to(self.device)
-        self.target_q_model = QModel(action_dim=self.env.action_space.n, hidden_dim=256, embed_dim=self.world_model.embed_dim).to(self.device)
+        # self.q_model = QModel(action_dim=self.env.action_space.n, hidden_dim=256, embed_dim=self.world_model.embed_dim).to(self.device)
+        # self.target_q_model = QModel(action_dim=self.env.action_space.n, hidden_dim=256, embed_dim=self.world_model.embed_dim).to(self.device)
 
-        self.q_model_optimizer = torch.optim.Adam(self.q_model.parameters(), lr=0.0001)
+        # self.q_model_optimizer = torch.optim.Adam(self.q_model.parameters(), lr=0.0001)
+
+        self.critic = Critic(num_inputs=self.world_model.embed_dim, 
+                             num_actions=self.n_actions, 
+                             hidden_dim=self.ac_hidden_size, 
+                             name=f"critic").to(device=self.device)
+
+        self.critic_optim = Adam(self.critic.parameters(), lr=self.learning_rate)
+
+        self.critic_target = Critic(num_inputs=self.world_model.embed_dim, 
+                                    num_actions=self.n_actions, 
+                                    hidden_dim=self.ac_hidden_size, 
+                                    name=f"critic_target").to(self.device)
+        
+        hard_update(self.critic_target, self.critic)
+
+        self.policy = Actor(num_inputs=self.world_model.embed_dim, 
+                            num_actions=self.n_actions, 
+                            hidden_dim=self.ac_hidden_size, 
+                            action_space=self.env.action_space, 
+                            name=f"policy").to(self.device)
+
+        self.policy_optim = Adam(self.policy.parameters(), lr=self.learning_rate)
 
         self.target_update_interval = target_update_interval
 
