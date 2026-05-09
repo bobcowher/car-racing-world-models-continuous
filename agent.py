@@ -4,7 +4,8 @@ import torch
 from buffer import ReplayBuffer
 from utils import display_stacked_obs
 from models.world_model import WorldModel
-from models.q_model import QModel
+from models.actor import Actor
+from models.critic import Critic
 import cv2
 import torch.nn.functional as F
 from torch.utils.tensorboard.writer import SummaryWriter
