@@ -2,7 +2,7 @@ import os
 import gymnasium as gym
 import torch
 from buffer import ReplayBuffer
-from utils import hard_update
+from utils import hard_update, soft_update
 from models.world_model import WorldModel
 from models.actor import Actor
 from models.critic import Critic
@@ -48,10 +48,13 @@ class Agent:
     def __init__(self, env : gym.Env,
                        max_buffer_size : int = 10000,
                        world_model_batch_size = 8,
-                       target_update_interval = 10000) -> None:
+                       target_update_interval = 10000,
+                       alpha : float = 0.1,
+                       tau : float = 0.005) -> None:
         self.env = env
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self.learning_rate = 0.0001
+        self.alpha = alpha
 
         os.makedirs("checkpoints", exist_ok=True)
         os.makedirs("runs", exist_ok=True)
@@ -155,7 +158,7 @@ class Agent:
             # Select actions for the entire batch (epsilon-greedy)
             with torch.no_grad():
                 # Get Q-values for current batch
-                q_vals = self.q_model(current_embeds) # (batch_size, n_actions)
+                q_vals = self.actor(current_embeds) # (batch_size, n_actions)
                 best_actions = q_vals.argmax(dim=1)   # (batch_size,)
                 
                 random_actions = torch.randint(0, self.env.action_space.n, (batch_size,), device=self.device)
@@ -217,44 +220,72 @@ class Agent:
             total_dynamics / epochs,
         )
 
-    
 
+    def train_actor_critic(self, sampler, horizon, batch_size, updates, epochs):
 
-    def train_q_model_on_mixed(self, sampler, horizon, batch_size, epochs=1):
-        """Train Q-model using MixedSampler (real buffer or imagination per call)."""
+        total_qf1_loss = 0.0
+        total_qf2_loss = 0.0
+        total_actor_loss = 0.0
+        total_alpha_loss = 0.0 
 
-        total_loss = 0.0
-        total_reward = 0.0
-
+        # Sample a batch from memory
         for _ in range(epochs):
-            states, actions, rewards, next_states, dones = sampler.sample(batch_size, horizon)
+            state_batch, action_batch, reward_batch, next_state_batch, mask_batch = sampler.sample(batch_size, horizon)
 
-            total_reward += rewards.mean().item()
-
-            actions = actions.unsqueeze(1).long()
-            rewards = rewards.unsqueeze(1)
-            dones   = dones.unsqueeze(1).float()
-
-            q_sa = self.q_model(states).gather(1, actions)
+            state_batch = torch.FloatTensor(state_batch).to(self.device)
+            next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+            action_batch = torch.FloatTensor(action_batch).to(self.device)
+            reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
+            mask_batch = torch.FloatTensor(mask_batch).to(self.device).unsqueeze(1)
 
             with torch.no_grad():
-                next_actions = self.q_model(next_states).argmax(dim=1, keepdim=True)
-                next_q       = self.target_q_model(next_states).gather(1, next_actions)
-                targets      = rewards + (1 - dones) * self.gamma * next_q
+                next_state_action, next_state_log_pi, _ = self.actor.sample(next_state_batch)
+                qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, next_state_action)
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
+                next_q_value = reward_batch + mask_batch * self.gamma * (min_qf_next_target)
 
-            loss = F.mse_loss(q_sa, targets)
-            self.q_model_optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.q_model.parameters(), max_norm=1.0)
-            self.q_model_optimizer.step()
+            qf1, qf2 = self.critic(state_batch, action_batch)  # Two Q-functions to mitigate positive bias in the policy improvement step
+            qf1_loss = F.mse_loss(qf1, next_q_value)  # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
+            qf2_loss = F.mse_loss(qf2, next_q_value)  # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
+            qf_loss = qf1_loss + qf2_loss
 
-            if self.total_steps % self.target_update_interval == 0:
-                self.target_q_model.load_state_dict(self.q_model.state_dict())
+            # Update the critic network
+            self.critic_optim.zero_grad()
+            qf_loss.backward()
+            self.critic_optim.step()
 
-            total_loss += loss.item()
-            self.total_steps += 1
+            # # Update the predictive model
+            # self.predictive_model_optim.zero_grad()
+            # prediction_error.backward()
+            # self.predictive_model_optim.step()
 
-        return total_loss / epochs, total_reward / epochs
+            pi, log_pi, _ = self.actor.sample(state_batch)
+
+            qf1_pi, qf2_pi = self.critic(state_batch, pi)
+            min_qf_pi = torch.min(qf1_pi, qf2_pi)
+
+            actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean() # Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
+
+            self.actor_optim.zero_grad()
+            actor_loss.backward()
+            self.actor_optim.step()
+
+
+            alpha_loss = torch.tensor(0.).to(self.device)
+            alpha_tlogs = torch.tensor(self.alpha) # For TensorboardX logs
+
+
+            if updates % self.target_update_interval == 0:
+                soft_update(self.critic_target, self.critic, self.tau)
+        
+            total_qf1_loss += qf1_loss.item()
+            total_qf2_loss += qf2_loss.item()
+            total_actor_loss += actor_loss.item()
+            total_alpha_loss += alpha_loss.item()
+
+        return total_qf1_loss / epochs, total_qf2_loss / epochs, total_actor_loss / epochs, total_alpha_loss / epochs
+
+
 
     def evaluate_reconstruction(self, num_samples=4, filename="reconstruction_test.png"):
         """Evaluate reconstruction quality by comparing original vs reconstructed observations.
