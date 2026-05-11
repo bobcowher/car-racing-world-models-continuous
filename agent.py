@@ -77,11 +77,6 @@ class Agent:
 
         self.world_model_batch_size = world_model_batch_size
 
-        # self.q_model = QModel(action_dim=self.env.action_space.n, hidden_dim=256, embed_dim=self.world_model.embed_dim).to(self.device)
-        # self.target_q_model = QModel(action_dim=self.env.action_space.n, hidden_dim=256, embed_dim=self.world_model.embed_dim).to(self.device)
-
-        # self.q_model_optimizer = torch.optim.Adam(self.q_model.parameters(), lr=0.0001)
-
         self.critic = Critic(num_inputs=self.world_model.embed_dim, 
                              num_actions=self.n_actions, 
                              hidden_dim=self.ac_hidden_size, 
@@ -108,14 +103,6 @@ class Agent:
 
         self.gamma = 0.99
         self.tau = tau
-
-        self.epsilon = 1
-        self.min_epsilon = 0.1
-        self.epsilon_decay = 0.98
-
-        self.imagine_epsilon = 1
-        self.imagine_min_epsilon = 0.1
-        self.imagine_epsilon_decay = 0.99
 
         self.total_steps = 0
     
@@ -263,8 +250,6 @@ class Agent:
 
 
             alpha_loss = torch.tensor(0.).to(self.device)
-            alpha_tlogs = torch.tensor(self.alpha) # For TensorboardX logs
-
 
             if updates % self.target_update_interval == 0:
                 soft_update(self.critic_target, self.critic, self.tau)
@@ -325,12 +310,12 @@ class Agent:
 
     def load(self):
         self.world_model.load_the_model("world_model", device=self.device)
-        self.actor.load_the_model("q_model", device=self.device)
-        self.critic.load_the_model("q_model", device=self.device)
+        self.actor.load_the_model("actor", device=self.device)
+        self.critic.load_the_model("critic", device=self.device)
         hard_update(self.critic_target, self.critic)
 
     def test(self, episodes=10):
-        self.q_model.eval()
+        self.actor.eval()
         total_rewards = []
 
         for episode in range(episodes):
@@ -340,16 +325,15 @@ class Agent:
             episode_reward = 0.0
 
             while not done:
-                # Encode observation to latent space before Q-model
                 with torch.no_grad():
                     obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
-                    embed = self.world_model.encode(obs_t).squeeze(1)  # (1, embed_dim)
-                    action = self.q_model(embed).argmax(dim=1).item()
+                    embed = self.world_model.encode(obs_t).squeeze(1)
+                    action = self.select_action(embed, evaluate=True)
 
                 next_obs, reward, term, trunc, _ = self.env.step(action)
                 next_obs = self.process_observation(next_obs)
                 done = term or trunc
-                episode_reward += reward
+                episode_reward += float(reward)
                 obs = next_obs
 
             total_rewards.append(episode_reward)
@@ -357,7 +341,7 @@ class Agent:
 
         avg = sum(total_rewards) / len(total_rewards)
         print(f"Average reward over {episodes} episodes: {avg:.1f}")
-        self.q_model.train()
+        self.actor.train()
         return total_rewards
 
     def select_action(self, state, evaluate=False):
@@ -413,12 +397,7 @@ class Agent:
 
                 obs = next_obs
 
-            # Adjust epsilon.
-            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-            self.imagine_epsilon = max(self.imagine_min_epsilon, self.imagine_epsilon * self.imagine_epsilon_decay)
-
-            # Log stats for the current training iteration 
-            print(f"Episode {episode} | reward: {episode_reward:.1f} | epsilon: {self.epsilon:.3f} | steps: {episode_steps}")
+            print(f"Episode {episode} | reward: {episode_reward:.1f} | steps: {episode_steps}")
 
             if episode_reward > best_score:
                 best_score = episode_reward
@@ -481,7 +460,6 @@ class Agent:
                 writer.add_scalar("SAC/alpha_loss", total_alpha_loss / ac_updates, episode)
 
             writer.add_scalar("Train/episode_reward", episode_reward, episode)
-            writer.add_scalar("Train/epsilon", self.epsilon, episode)
             writer.add_scalar("Train/avg_critic_loss", episode_loss, episode)
             writer.add_scalar("Train/real_ratio", current_real_ratio, episode)
             writer.add_scalar("Train/best_score", best_score, episode)
