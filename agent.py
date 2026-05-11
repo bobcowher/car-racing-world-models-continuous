@@ -2,7 +2,7 @@ import os
 import gymnasium as gym
 import torch
 from buffer import ReplayBuffer
-from utils import hard_update, soft_update
+from utils import hard_update, soft_update, display_stacked_obs
 from models.world_model import WorldModel
 from models.actor import Actor
 from models.critic import Critic
@@ -107,6 +107,7 @@ class Agent:
         self.target_update_interval = target_update_interval
 
         self.gamma = 0.99
+        self.tau = tau
 
         self.epsilon = 1
         self.min_epsilon = 0.1
@@ -155,23 +156,13 @@ class Agent:
         current_embeds = embeds
 
         for _ in range(horizon):
-            # Select actions for the entire batch (epsilon-greedy)
             with torch.no_grad():
-                # Get Q-values for current batch
-                q_vals = self.actor(current_embeds) # (batch_size, n_actions)
-                best_actions = q_vals.argmax(dim=1)   # (batch_size,)
-                
-                random_actions = torch.randint(0, self.env.action_space.n, (batch_size,), device=self.device)
-                exploring_mask = (torch.rand(batch_size, device=self.device) < self.imagine_epsilon).long()
-                action_idx = exploring_mask * random_actions + (1 - exploring_mask) * best_actions
+                action, _, _ = self.actor.sample(current_embeds)  # (batch_size, n_actions)
 
-                action_onehot = F.one_hot(action_idx, num_classes=self.env.action_space.n).float()
-
-                # Imagine next step in parallel
-                next_embeds, rewards, dones = self.world_model.imagine_step(current_embeds, action_onehot)
+                next_embeds, rewards, dones = self.world_model.imagine_step(current_embeds, action)
 
                 all_states.append(current_embeds)
-                all_actions.append(action_idx)
+                all_actions.append(action)
                 all_rewards.append(rewards.squeeze(-1))
                 all_next_states.append(next_embeds)
                 all_dones.append((dones.squeeze(-1) > 0.5).float())
@@ -232,11 +223,11 @@ class Agent:
         for _ in range(epochs):
             state_batch, action_batch, reward_batch, next_state_batch, mask_batch = sampler.sample(batch_size, horizon)
 
-            state_batch = torch.FloatTensor(state_batch).to(self.device)
-            next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
-            action_batch = torch.FloatTensor(action_batch).to(self.device)
-            reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
-            mask_batch = torch.FloatTensor(mask_batch).to(self.device).unsqueeze(1)
+            state_batch = state_batch.float().to(self.device)
+            next_state_batch = next_state_batch.float().to(self.device)
+            action_batch = action_batch.float().to(self.device)
+            reward_batch = reward_batch.float().to(self.device).unsqueeze(1)
+            mask_batch = mask_batch.float().to(self.device).unsqueeze(1)
 
             with torch.no_grad():
                 next_state_action, next_state_log_pi, _ = self.actor.sample(next_state_batch)
@@ -303,7 +294,7 @@ class Agent:
 
         with torch.no_grad():
             # Get reconstructions from world model
-            dummy_action = torch.zeros(num_samples, self.env.action_space.n, device=self.device)
+            dummy_action = torch.zeros(num_samples, self.n_actions, device=self.device)
             recon, _, _, _, _ = self.world_model.forward(obs_normalized, dummy_action)
 
         # Prepare visualization pairs
@@ -444,10 +435,12 @@ class Agent:
             total_done_loss = 0.0
             total_recon_loss = 0.0
             total_dynamics_loss = 0.0
-            total_q_loss = 0.0
-            total_imag_reward = 0.0
+            total_qf1_loss = 0.0
+            total_qf2_loss = 0.0
+            total_actor_loss = 0.0
+            total_alpha_loss = 0.0
             wm_updates = 0
-            q_updates = 0
+            ac_updates = 0
 
             for _ in range(offline_training_epochs):
                 # World model updates
@@ -461,17 +454,19 @@ class Agent:
                     wm_updates += 1
 
                 for _ in range(current_ratio[1]):
-                    q_loss, imag_reward = self.train_q_model_on_mixed(mixed_sampler, rollout_steps, batch_size, epochs=1)
-                    total_q_loss += q_loss
-                    total_imag_reward += imag_reward
-                    q_updates += 1
+                    qf1_loss, qf2_loss, actor_loss, alpha_loss = self.train_actor_critic(mixed_sampler, rollout_steps, batch_size, updates=ac_updates, epochs=1)
+                    total_qf1_loss += qf1_loss
+                    total_qf2_loss += qf2_loss
+                    total_actor_loss += actor_loss
+                    total_alpha_loss += alpha_loss
+                    ac_updates += 1
 
             avg_combined_loss = total_combined_loss / wm_updates if wm_updates > 0 else 0.0
             avg_reward_loss = total_reward_loss / wm_updates if wm_updates > 0 else 0.0
             avg_done_loss = total_done_loss / wm_updates if wm_updates > 0 else 0.0
             avg_recon_loss = total_recon_loss / wm_updates if wm_updates > 0 else 0.0
             avg_dynamics_loss = total_dynamics_loss / wm_updates if wm_updates > 0 else 0.0
-            episode_loss = total_q_loss / q_updates if q_updates > 0 else 0.0
+            episode_loss = (total_qf1_loss + total_qf2_loss) / (2 * ac_updates) if ac_updates > 0 else 0.0
 
             writer.add_scalar("World Model/combined_loss", avg_combined_loss, episode)
             writer.add_scalar("World Model/reconstruction_loss", avg_recon_loss, episode)
@@ -479,13 +474,15 @@ class Agent:
             writer.add_scalar("World Model/reward_loss", avg_reward_loss, episode)
             writer.add_scalar("World Model/done_loss", avg_done_loss, episode)
 
-            if q_updates > 0:
-                avg_imag_reward = total_imag_reward / q_updates
-                writer.add_scalar("Imagination/mean_reward_per_step", avg_imag_reward, episode)
+            if ac_updates > 0:
+                writer.add_scalar("SAC/qf1_loss", total_qf1_loss / ac_updates, episode)
+                writer.add_scalar("SAC/qf2_loss", total_qf2_loss / ac_updates, episode)
+                writer.add_scalar("SAC/actor_loss", total_actor_loss / ac_updates, episode)
+                writer.add_scalar("SAC/alpha_loss", total_alpha_loss / ac_updates, episode)
 
             writer.add_scalar("Train/episode_reward", episode_reward, episode)
             writer.add_scalar("Train/epsilon", self.epsilon, episode)
-            writer.add_scalar("Train/avg_q_loss", episode_loss, episode)
+            writer.add_scalar("Train/avg_critic_loss", episode_loss, episode)
             writer.add_scalar("Train/real_ratio", current_real_ratio, episode)
             writer.add_scalar("Train/best_score", best_score, episode)
 
