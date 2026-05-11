@@ -64,7 +64,7 @@ class Agent:
         self.n_actions = self.env.action_space.shape[0] # 3
         self.ac_hidden_size = 512
 
-        self.memory = ReplayBuffer(max_size=max_buffer_size, input_shape=obs.shape, input_device=self.device, output_device=self.device)
+        self.memory = ReplayBuffer(max_size=max_buffer_size, input_shape=obs.shape, input_device=self.device, output_device=self.device, action_dim=self.n_actions)
 
         self.world_model = WorldModel(observation_shape=obs.shape, embed_dim=1024, n_actions=self.n_actions).to(self.device)
 
@@ -287,7 +287,8 @@ class Agent:
 
     def save(self):
         self.world_model.save_the_model("world_model", verbose=True)
-        self.q_model.save_the_model("q_model", verbose=True)
+        self.actor.save_the_model("actor", verbose=True)
+        self.critic.save_the_model("critic", verbose=True)
 
     def save_best(self, score, episode):
         path = "checkpoints/best.pt"
@@ -295,7 +296,8 @@ class Agent:
             "episode": episode,
             "score": score,
             "world_model": self.world_model.state_dict(),
-            "q_model": self.q_model.state_dict(),
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
         }, path)
         print(f"Saved best checkpoint to {path} | episode: {episode} | score: {score:.1f}")
 
@@ -337,11 +339,15 @@ class Agent:
         return total_rewards
 
     def select_action(self, state, evaluate=False):
-        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        if not isinstance(state, torch.Tensor):
+            state = torch.tensor(state, dtype=torch.float32)
+        state = state.float().to(self.device)
+        if state.dim() < 2:
+            state = state.unsqueeze(0)
         if evaluate is False:
-            action, _, _ = self.policy.sample(state)
+            action, _, _ = self.actor.sample(state)
         else:
-            _, _, action = self.policy.sample(state)
+            _, _, action = self.actor.sample(state)
         return action.detach().cpu().numpy()[0]
 
     def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5):

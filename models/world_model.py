@@ -114,8 +114,8 @@ class WorldModel(BaseModel):
         if next_obs_normalized.ndim == 5:
             next_obs_normalized = next_obs_normalized.squeeze(1)
 
-        # Convert actions to one-hot
-        action_onehot = F.one_hot(actions.long(), num_classes=self.n_actions).float()
+        # Pass continuous actions directly (already (B, n_actions))
+        action_onehot = actions.float()
 
         # Forward pass
         recon, _, next_embed_pred, reward_pred, done_pred = self.forward(obs_normalized, action_onehot)

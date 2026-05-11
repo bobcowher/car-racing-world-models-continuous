@@ -3,7 +3,7 @@ import os
 
 class ReplayBuffer:
     def __init__(self, max_size, input_shape,
-                 input_device, output_device='cpu'):
+                 input_device, output_device='cpu', action_dim=1):
         self.mem_size = max_size
         self.mem_ctr  = 0
 
@@ -27,8 +27,7 @@ class ReplayBuffer:
             (max_size, *input_shape), dtype=torch.uint8, device=self.input_device
         )
 
-        # Actions as scalar indices for torch.gather
-        self.action_memory  = torch.zeros(max_size, dtype=torch.int64,
+        self.action_memory  = torch.zeros((max_size, action_dim), dtype=torch.float32,
                                           device=self.input_device)
         self.reward_memory  = torch.zeros(max_size, dtype=torch.float32,
                                           device=self.input_device)
@@ -48,7 +47,7 @@ class ReplayBuffer:
         self.next_state_memory[idx] = torch.as_tensor(
             next_state, dtype=torch.uint8, device=self.input_device)
 
-        self.action_memory[idx]   = int(action)
+        self.action_memory[idx]   = torch.as_tensor(action, dtype=torch.float32, device=self.input_device)
         self.reward_memory[idx]   = float(reward)
         self.terminal_memory[idx] = bool(done)
 
