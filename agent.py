@@ -104,18 +104,6 @@ class Agent:
         self.gamma = 0.99
         self.tau = tau
 
-        # Auto-tuned entropy temperature.
-        # target_entropy = -|A| is the standard SAC heuristic.
-        # Floor at -1.0 (alpha >= 0.37) keeps meaningful entropy at all times —
-        # going lower caused policy collapse in practice. Ceiling at 2.0 (alpha ~7.4)
-        # prevents a fully random policy early on.
-        # Dedicated LR of 3e-5 (3x slower than actor/critic) prevents alpha from
-        # collapsing faster than the policy can adapt.
-        self.target_entropy = -float(self.n_actions)
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-        self.alpha = self.log_alpha.exp().item()
-        self.alpha_optim = Adam([self.log_alpha], lr=3e-5)
-
         self.total_steps = 0
     
     def normalize_observation(self, obs):
@@ -242,6 +230,7 @@ class Agent:
             # Update the critic network
             self.critic_optim.zero_grad()
             qf_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
             self.critic_optim.step()
 
             # # Update the predictive model
@@ -258,16 +247,10 @@ class Agent:
 
             self.actor_optim.zero_grad()
             actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_optim.step()
 
-            # Alpha update — detach log_pi so actor gradients are isolated.
-            alpha_loss = -(self.log_alpha * (log_pi.detach() + self.target_entropy)).mean()
-            self.alpha_optim.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optim.step()
-            with torch.no_grad():
-                self.log_alpha.clamp_(-1.0, 2.0)
-            self.alpha = self.log_alpha.exp().item()
+            alpha_loss = torch.tensor(0.).to(self.device)
 
             if updates % self.target_update_interval == 0:
                 soft_update(self.critic_target, self.critic, self.tau)
