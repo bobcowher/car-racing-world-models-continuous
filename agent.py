@@ -48,7 +48,6 @@ class Agent:
     def __init__(self, env : gym.Env,
                        max_buffer_size : int = 10000,
                        world_model_batch_size = 8,
-                       target_update_interval = 10000,
                        alpha : float = 0.1,
                        tau : float = 0.005) -> None:
         self.env = env
@@ -98,8 +97,6 @@ class Agent:
                             name=f"policy").to(self.device)
 
         self.actor_optim = Adam(self.actor.parameters(), lr=self.learning_rate)
-
-        self.target_update_interval = target_update_interval
 
         self.gamma = 0.99
         self.tau = tau
@@ -199,14 +196,12 @@ class Agent:
         )
 
 
-    def train_actor_critic(self, sampler, horizon, batch_size, updates, epochs):
+    def train_actor_critic(self, sampler, horizon, batch_size, epochs):
 
         total_qf1_loss = 0.0
         total_qf2_loss = 0.0
         total_actor_loss = 0.0
-        total_alpha_loss = 0.0 
 
-        # Sample a batch from memory
         for _ in range(epochs):
             state_batch, action_batch, reward_batch, next_state_batch, mask_batch = sampler.sample(batch_size, horizon)
 
@@ -233,11 +228,6 @@ class Agent:
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
             self.critic_optim.step()
 
-            # # Update the predictive model
-            # self.predictive_model_optim.zero_grad()
-            # prediction_error.backward()
-            # self.predictive_model_optim.step()
-
             pi, log_pi, _ = self.actor.sample(state_batch)
 
             qf1_pi, qf2_pi = self.critic(state_batch, pi)
@@ -250,17 +240,11 @@ class Agent:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_optim.step()
 
-            alpha_loss = torch.tensor(0.).to(self.device)
-
-            if updates % self.target_update_interval == 0:
-                soft_update(self.critic_target, self.critic, self.tau)
-        
             total_qf1_loss += qf1_loss.item()
             total_qf2_loss += qf2_loss.item()
             total_actor_loss += actor_loss.item()
-            total_alpha_loss += alpha_loss.item()
 
-        return total_qf1_loss / epochs, total_qf2_loss / epochs, total_actor_loss / epochs, total_alpha_loss / epochs
+        return total_qf1_loss / epochs, total_qf2_loss / epochs, total_actor_loss / epochs
 
 
 
@@ -418,7 +402,6 @@ class Agent:
             total_qf1_loss = 0.0
             total_qf2_loss = 0.0
             total_actor_loss = 0.0
-            total_alpha_loss = 0.0
             wm_updates = 0
             ac_updates = 0
 
@@ -434,12 +417,13 @@ class Agent:
                     wm_updates += 1
 
                 for _ in range(current_ratio[1]):
-                    qf1_loss, qf2_loss, actor_loss, alpha_loss = self.train_actor_critic(mixed_sampler, rollout_steps, batch_size, updates=ac_updates, epochs=1)
+                    qf1_loss, qf2_loss, actor_loss = self.train_actor_critic(mixed_sampler, rollout_steps, batch_size, epochs=1)
                     total_qf1_loss += qf1_loss
                     total_qf2_loss += qf2_loss
                     total_actor_loss += actor_loss
-                    total_alpha_loss += alpha_loss
                     ac_updates += 1
+
+            soft_update(self.critic_target, self.critic, self.tau)
 
             avg_combined_loss = total_combined_loss / wm_updates if wm_updates > 0 else 0.0
             avg_reward_loss = total_reward_loss / wm_updates if wm_updates > 0 else 0.0
@@ -458,8 +442,6 @@ class Agent:
                 writer.add_scalar("SAC/qf1_loss", total_qf1_loss / ac_updates, episode)
                 writer.add_scalar("SAC/qf2_loss", total_qf2_loss / ac_updates, episode)
                 writer.add_scalar("SAC/actor_loss", total_actor_loss / ac_updates, episode)
-                writer.add_scalar("SAC/alpha_loss", total_alpha_loss / ac_updates, episode)
-                writer.add_scalar("SAC/alpha", self.alpha, episode)
 
             writer.add_scalar("Train/episode_reward", episode_reward, episode)
             writer.add_scalar("Train/avg_critic_loss", episode_loss, episode)
