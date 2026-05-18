@@ -9,3 +9,5 @@ GEMINI.md
 test_*
 BEEKEEPER_*.md
 .claude/
+.qwen
+AGENTS.md
