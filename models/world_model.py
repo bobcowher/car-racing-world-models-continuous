@@ -36,6 +36,7 @@ class WorldModel(BaseModel):
         self.done_pred = nn.Linear(gru_dim + n_actions, 1)
 
         self.embed_dim = embed_dim
+        self.gru_dim = gru_dim
         self.n_actions = n_actions
 
         self.gru = nn.GRU(input_size=embed_dim, hidden_size=gru_dim, batch_first=True)
@@ -49,7 +50,7 @@ class WorldModel(BaseModel):
     def normalize_embedding(self, embed):
         return self.embed_norm_layer(embed)
 
-    def encode(self, obs):
+    def encode(self, obs, hidden=None):
         # If obs is [B, C, H, W], add sequence dimension -> [B, 1, C, H, W]
         if obs.ndim == 4:
             obs = obs.unsqueeze(1)
@@ -63,10 +64,10 @@ class WorldModel(BaseModel):
 
         embeds = embed_flat.view(batch_size, sequence_length, -1)
 
-        gru_out, hidden = self.gru(embeds) 
+        gru_out, hidden = self.gru(embeds, hidden) 
         h_t = gru_out.squeeze(1)
 
-        return embeds, h_t
+        return embeds, h_t, hidden
 
     def decode(self, embeds):
         return self.decoder(embeds)
@@ -96,7 +97,7 @@ class WorldModel(BaseModel):
         reward = self.reward_pred(embed_action)
         done = torch.sigmoid(self.done_pred(embed_action))
 
-        return next_h_t, next_hidden_state, reward, done
+        return next_embed, next_h_t, next_hidden_state, reward, done
 
     def compute_loss(self, obs, actions, rewards, next_obs, dones):
         """
@@ -133,7 +134,7 @@ class WorldModel(BaseModel):
 
         # === 2. Dynamics Loss ===
         # Encode next observation to get target embedding
-        next_embeds, next_h_t = self.encode(next_obs_normalized)  # (B, 1, embed_dim)
+        next_embeds, _, _ = self.encode(next_obs_normalized)  # (B, 1, embed_dim)
         next_embed_target = next_embeds.view(-1, next_embeds.shape[-1])  # (B, embed_dim)
 
         # MSE between predicted and actual next embedding
@@ -179,7 +180,7 @@ class WorldModel(BaseModel):
             done_pred: (B, 1) predicted done probability
         """
         # Encode observation to latent state
-        embeds, h_t = self.encode(obs)  # (B, 1, embed_dim)
+        embeds, h_t, _ = self.encode(obs)  # (B, 1, embed_dim)
 
         # Decode for reconstruction
         embeds_flat = embeds.view(-1, embeds.shape[-1])  # (B, embed_dim)

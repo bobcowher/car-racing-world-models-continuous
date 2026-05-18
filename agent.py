@@ -34,8 +34,8 @@ class MixedSampler:
         # Sample batch_size*horizon to match imagined output size
         obs, actions, rewards, next_obs, dones = agent.memory.sample_buffer(batch_size * horizon)
         with torch.no_grad():
-            states      = agent.world_model.encode(agent.normalize_observation(obs)).squeeze(1)
-            next_states = agent.world_model.encode(agent.normalize_observation(next_obs)).squeeze(1)
+            _, states, _      = agent.world_model.encode(agent.normalize_observation(obs))
+            _, next_states, _ = agent.world_model.encode(agent.normalize_observation(next_obs))
         rewards = rewards.float()
         return states, actions, rewards, next_states, dones
 
@@ -76,21 +76,21 @@ class Agent:
 
         self.world_model_batch_size = world_model_batch_size
 
-        self.critic = Critic(num_inputs=self.world_model.embed_dim, 
+        self.critic = Critic(num_inputs=self.world_model.gru_dim, 
                              num_actions=self.n_actions, 
                              hidden_dim=self.ac_hidden_size, 
                              name=f"critic").to(device=self.device)
 
         self.critic_optim = Adam(self.critic.parameters(), lr=self.learning_rate)
 
-        self.critic_target = Critic(num_inputs=self.world_model.embed_dim, 
+        self.critic_target = Critic(num_inputs=self.world_model.gru_dim, 
                                     num_actions=self.n_actions, 
                                     hidden_dim=self.ac_hidden_size, 
                                     name=f"critic_target").to(self.device)
         
         hard_update(self.critic_target, self.critic)
 
-        self.actor = Actor(num_inputs=self.world_model.embed_dim, 
+        self.actor = Actor(num_inputs=self.world_model.gru_dim, 
                             num_actions=self.n_actions, 
                             hidden_dim=self.ac_hidden_size, 
                             action_space=self.env.action_space, 
@@ -128,7 +128,7 @@ class Agent:
 
         # Encode initial observations to latent space
         with torch.no_grad():
-            embeds = self.world_model.encode(obs).squeeze(1)  # (batch_size, embed_dim)
+            embeds, current_h_t, _ = self.world_model.encode(obs)  # (batch_size, embed_dim)
 
         # Lists to store rollout steps
         all_states      = []
@@ -137,21 +137,22 @@ class Agent:
         all_next_states = []
         all_dones       = []
 
-        current_embeds = embeds
+        current_embeds = embeds.squeeze(1)
 
         for _ in range(horizon):
             with torch.no_grad():
-                action, _, _ = self.actor.sample(current_embeds)  # (batch_size, n_actions)
+                action, _, _ = self.actor.sample(current_h_t)  # (batch_size, n_actions)
 
-                next_embeds, rewards, dones = self.world_model.imagine_step(current_embeds, action)
+                next_embeds, next_h_t, next_hidden_states, rewards, dones = self.world_model.imagine_step(current_embeds, current_h_t, action)
 
-                all_states.append(current_embeds)
+                all_states.append(current_h_t)
                 all_actions.append(action)
                 all_rewards.append(rewards.squeeze(-1))
-                all_next_states.append(next_embeds)
+                all_next_states.append(next_h_t)
                 all_dones.append((dones.squeeze(-1) > 0.5).float())
 
                 current_embeds = next_embeds
+                current_h_t = next_h_t
 
         # Concatenate and flatten for the Q-learner
         states      = torch.cat(all_states, dim=0)      # (batch_size * horizon, embed_dim)
@@ -312,7 +313,7 @@ class Agent:
             while not done:
                 with torch.no_grad():
                     obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
-                    embed = self.world_model.encode(obs_t).squeeze(1)
+                    embed, h_t, _ = self.world_model.encode(obs_t)
                     action = self.select_action(embed, evaluate=True)
 
                 next_obs, reward, term, trunc, _ = self.env.step(action)
@@ -362,12 +363,14 @@ class Agent:
             episode_loss = 0.0
             episode_steps = 0
 
+            hidden = None
+
             while not done:
 
                 with torch.no_grad():
                     obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
-                    embed = self.world_model.encode(obs_t).squeeze(1)  # (1, embed_dim)
-                    action = self.select_action(embed)
+                    embed, h_t, hidden = self.world_model.encode(obs_t, hidden=hidden)  # (1, embed_dim)
+                    action = self.select_action(h_t)
 
                 next_obs, reward, term, trunc, _ = self.env.step(action)
 
