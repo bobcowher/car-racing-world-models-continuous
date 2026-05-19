@@ -1,4 +1,5 @@
 import os
+import subprocess
 import gymnasium as gym
 import torch
 from buffer import ReplayBuffer
@@ -344,7 +345,7 @@ class Agent:
         self.actor.train()
         return total_rewards
 
-    def select_action(self, state, evaluate=False):
+    def select_action(self, state, evaluate=False, min_gas=0.3):
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, dtype=torch.float32)
         state = state.float().to(self.device)
@@ -354,13 +355,20 @@ class Agent:
             action, _, _ = self.actor.sample(state)
         else:
             _, _, action = self.actor.sample(state)
-        return action.detach().cpu().numpy()[0]
+        action = action.detach().cpu().numpy()[0]
+        action[1] = max(action[1], min_gas)  # gas is index 1, floor at min_gas
+        return action
 
     def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5, warmup_episodes=5):
 
         rollout_steps = imagination_steps if imagination_steps is not None else batch_size
 
-        run_tag = f'world_model_large_buffer'
+        try:
+            run_tag = subprocess.check_output(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            run_tag = 'unknown'
         summary_writer_name = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{run_tag}'
 
         writer = SummaryWriter(summary_writer_name)
