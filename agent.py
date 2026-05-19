@@ -343,7 +343,7 @@ class Agent:
         self.actor.train()
         return total_rewards
 
-    def select_action(self, state, evaluate=False):
+    def select_action(self, state, evaluate=False, min_gas=0.3):
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, dtype=torch.float32)
         state = state.float().to(self.device)
@@ -353,7 +353,9 @@ class Agent:
             action, _, _ = self.actor.sample(state)
         else:
             _, _, action = self.actor.sample(state)
-        return action.detach().cpu().numpy()[0]
+        action = action.detach().cpu().numpy()[0]
+        action[1] = max(action[1], min_gas)  # gas is index 1, floor at min_gas
+        return action
 
     def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5, warmup_episodes=5):
 
