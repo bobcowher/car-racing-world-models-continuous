@@ -357,7 +357,7 @@ class Agent:
         action[1] = max(action[1], min_gas)  # gas is index 1, floor at min_gas
         return action
 
-    def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5, warmup_episodes=5, run_tag=None):
+    def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5, warmup_episodes=5, run_tag=None, encoder_freeze_episode=None):
 
         rollout_steps = imagination_steps if imagination_steps is not None else batch_size
 
@@ -477,6 +477,14 @@ class Agent:
             writer.add_scalar("Train/avg_critic_loss", episode_loss, episode)
             writer.add_scalar("Train/real_ratio", current_real_ratio, episode)
             writer.add_scalar("Train/best_score", best_score, episode)
+
+            if encoder_freeze_episode is not None and episode == encoder_freeze_episode:
+                for param in self.world_model.encoder.parameters():
+                    param.requires_grad = False
+                for param in self.world_model.embed_norm_layer.parameters():
+                    param.requires_grad = False
+                print(f"Episode {episode}: Encoder frozen — embedding space now stable.")
+                writer.add_scalar("Train/encoder_frozen", 1.0, episode)
 
             if episode % 10 == 0:
                 self.evaluate_reconstruction(num_samples=4, filename="reconstruction_test.png")
