@@ -388,6 +388,8 @@ class Agent:
             episode_reward = 0.0
             episode_loss = 0.0
             episode_steps = 0
+            episode_terminated = False
+            episode_truncated = False
 
             while not done:
 
@@ -402,6 +404,8 @@ class Agent:
                 next_obs = self.process_observation(next_obs)
 
                 done = (term or trunc)
+                episode_terminated = episode_terminated or term
+                episode_truncated = episode_truncated or trunc
 
                 self.memory.store_transition(obs, action, reward, next_obs, term, done)
 
@@ -477,6 +481,8 @@ class Agent:
             writer.add_scalar("Train/avg_critic_loss", episode_loss, episode)
             writer.add_scalar("Train/real_ratio", current_real_ratio, episode)
             writer.add_scalar("Train/best_score", best_score, episode)
+            writer.add_scalar("Train/terminated", float(episode_terminated), episode)
+            writer.add_scalar("Train/truncated", float(episode_truncated), episode)
 
             if episode % 10 == 0:
                 self.evaluate_reconstruction(num_samples=4, filename="reconstruction_test.png")

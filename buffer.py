@@ -89,7 +89,10 @@ class ReplayBuffer:
         boundaries still allow Q-value bootstrapping.
         """
         max_mem = min(self.mem_ctr, self.mem_size)
-        starts = torch.randint(0, max_mem, (batch_size,), device=self.input_device)
+        # Guard: exclude the last n slots so the rollout window never reaches
+        # unwritten positions (early fill) or crosses the circular-buffer write edge.
+        safe_max = max(1, max_mem - n)
+        starts = torch.randint(0, safe_max, (batch_size,), device=self.input_device)
 
         states  = self.state_memory[starts].to(self.output_device, dtype=torch.float32)
         actions = self.action_memory[starts].to(self.output_device)
