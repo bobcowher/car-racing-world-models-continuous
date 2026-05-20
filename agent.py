@@ -54,7 +54,8 @@ class Agent:
                        n_step: int = 5) -> None:
         self.env = env
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        self.learning_rate = 0.0001
+        self.critic_lr = 0.0001
+        self.actor_lr = 3e-5
         self.alpha = alpha
         self.n_step = n_step
 
@@ -75,7 +76,7 @@ class Agent:
 
         print(f"Observation shape: {obs.shape}")
 
-        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=self.learning_rate)
+        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=self.critic_lr)
 
         self.world_model_batch_size = world_model_batch_size
 
@@ -84,7 +85,7 @@ class Agent:
                              hidden_dim=self.ac_hidden_size, 
                              name=f"critic").to(device=self.device)
 
-        self.critic_optim = Adam(self.critic.parameters(), lr=self.learning_rate)
+        self.critic_optim = Adam(self.critic.parameters(), lr=self.critic_lr)
 
         self.critic_target = Critic(num_inputs=self.world_model.embed_dim, 
                                     num_actions=self.n_actions, 
@@ -99,7 +100,7 @@ class Agent:
                             action_space=self.env.action_space, 
                             name=f"policy").to(self.device)
 
-        self.actor_optim = Adam(self.actor.parameters(), lr=self.learning_rate)
+        self.actor_optim = Adam(self.actor.parameters(), lr=self.actor_lr)
 
         self.target_update_interval = target_update_interval
 
@@ -356,16 +357,22 @@ class Agent:
         action[1] = max(action[1], min_gas)  # gas is index 1, floor at min_gas
         return action
 
-    def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5, warmup_episodes=5):
+    def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5, warmup_episodes=5, run_tag=None):
 
         rollout_steps = imagination_steps if imagination_steps is not None else batch_size
 
-        try:
-            run_tag = subprocess.check_output(
-                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                stderr=subprocess.DEVNULL).decode().strip()
-        except Exception:
-            run_tag = 'unknown'
+        if run_tag is None:
+            try:
+                run_tag = subprocess.check_output(
+                    ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                    stderr=subprocess.DEVNULL).decode().strip()
+                if run_tag == 'HEAD':
+                    run_tag = subprocess.check_output(
+                        ['git', 'name-rev', '--name-only', 'HEAD'],
+                        stderr=subprocess.DEVNULL).decode().strip()
+                    run_tag = run_tag.replace('remotes/origin/', '').split('~')[0].split('^')[0]
+            except Exception:
+                run_tag = 'unknown'
         summary_writer_name = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{run_tag}'
 
         writer = SummaryWriter(summary_writer_name)
