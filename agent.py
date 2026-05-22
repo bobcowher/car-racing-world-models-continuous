@@ -394,14 +394,19 @@ class Agent:
 
         if run_tag is None:
             try:
+                # git branch --show-current is most reliable: returns branch name
+                # in attached HEAD, empty string in detached HEAD (git 2.22+)
                 run_tag = subprocess.check_output(
-                    ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                    ['git', 'branch', '--show-current'],
                     stderr=subprocess.DEVNULL).decode().strip()
-                if run_tag == 'HEAD':
+                if not run_tag:
+                    # Detached HEAD fallback: ask git to name the commit
                     run_tag = subprocess.check_output(
                         ['git', 'name-rev', '--name-only', 'HEAD'],
                         stderr=subprocess.DEVNULL).decode().strip()
                     run_tag = run_tag.replace('remotes/origin/', '').split('~')[0].split('^')[0]
+                if not run_tag:
+                    run_tag = 'unknown'
             except Exception:
                 run_tag = 'unknown'
         summary_writer_name = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{run_tag}'
