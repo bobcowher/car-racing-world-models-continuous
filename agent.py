@@ -51,14 +51,12 @@ class Agent:
                        max_buffer_size : int = 10000,
                        world_model_batch_size = 8,
                        target_update_interval = 10000,
-                       alpha : float = 0.1,
                        tau : float = 0.005,
                        n_step: int = 5) -> None:
         self.env = env
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self.critic_lr = 0.0001
         self.actor_lr = 3e-5
-        self.alpha = alpha
         self.n_step = n_step
 
         os.makedirs("checkpoints", exist_ok=True)
@@ -109,6 +107,12 @@ class Agent:
                             name=f"policy").to(self.device)
 
         self.actor_optim = Adam(self.actor.parameters(), lr=self.actor_lr)
+
+        # Trainable entropy coefficient — target entropy = -n_actions (standard SAC)
+        self.target_entropy = -self.n_actions
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+        self.alpha = self.log_alpha.exp().item()
+        self.alpha_optim = Adam([self.log_alpha], lr=self.critic_lr)
 
         self.target_update_interval = target_update_interval
 
@@ -270,7 +274,11 @@ class Agent:
             self.actor_optim.step()
 
 
-            alpha_loss = torch.tensor(0.).to(self.device)
+            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+            self.alpha_optim.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optim.step()
+            self.alpha = self.log_alpha.exp().item()
 
             soft_update(self.critic_target, self.critic, self.tau)
         
@@ -514,6 +522,7 @@ class Agent:
                 writer.add_scalar("SAC/qf2_loss", total_qf2_loss / ac_updates, episode)
                 writer.add_scalar("SAC/actor_loss", total_actor_loss / ac_updates, episode)
                 writer.add_scalar("SAC/alpha_loss", total_alpha_loss / ac_updates, episode)
+                writer.add_scalar("SAC/alpha", self.alpha, episode)
 
             writer.add_scalar("Train/episode_reward", episode_reward, episode)
             writer.add_scalar("Train/avg_critic_loss", episode_loss, episode)
