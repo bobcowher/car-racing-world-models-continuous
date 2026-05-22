@@ -57,7 +57,7 @@ class Agent:
         self.env = env
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self.critic_lr = 0.0001
-        self.actor_lr = 3e-5
+        self.actor_lr = 1e-4
         self.alpha = alpha
         self.n_step = n_step
 
