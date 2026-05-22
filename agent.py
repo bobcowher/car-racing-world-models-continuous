@@ -1,6 +1,8 @@
 import os
 import subprocess
 import gymnasium as gym
+from gymnasium.spaces import Box
+import numpy as np
 import torch
 from buffer import ReplayBuffer
 from utils import hard_update, soft_update, display_stacked_obs
@@ -66,8 +68,14 @@ class Agent:
 
         obs = self.process_observation(obs)
 
-        assert self.env.action_space.shape is not None # Gets rid of pyright warnings
-        self.n_actions = self.env.action_space.shape[0] # 3
+        # Actor operates in a structured 2D action space [steering, throttle_brake].
+        # throttle_brake ∈ [-1, 1]: positive → gas, negative → brake.
+        # decode_action() maps this to the 3D CarRacing action before env.step().
+        self.actor_action_space = Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+        )
+        self.n_actions = self.actor_action_space.shape[0]  # 2
         self.ac_hidden_size = 512
 
         self.memory = ReplayBuffer(max_size=max_buffer_size, input_shape=obs.shape, input_device=self.device, output_device=self.device, action_dim=self.n_actions)
@@ -94,10 +102,10 @@ class Agent:
         
         hard_update(self.critic_target, self.critic)
 
-        self.actor = Actor(num_inputs=self.world_model.embed_dim, 
-                            num_actions=self.n_actions, 
-                            hidden_dim=self.ac_hidden_size, 
-                            action_space=self.env.action_space, 
+        self.actor = Actor(num_inputs=self.world_model.embed_dim,
+                            num_actions=self.n_actions,
+                            hidden_dim=self.ac_hidden_size,
+                            action_space=self.actor_action_space,
                             name=f"policy").to(self.device)
 
         self.actor_optim = Adam(self.actor.parameters(), lr=self.actor_lr)
@@ -109,6 +117,19 @@ class Agent:
 
         self.total_steps = 0
     
+    def decode_action(self, actor_action: np.ndarray) -> np.ndarray:
+        """Map 2D actor action [steering, throttle_brake] to 3D CarRacing action.
+
+        throttle_brake ∈ [-1, 1]: positive values → gas, negative → brake.
+        This eliminates simultaneous gas+brake and keeps the stored action
+        identical to the policy distribution being optimized.
+        """
+        steering = float(actor_action[0])
+        tb       = float(actor_action[1])
+        gas      = max(0.0, tb)
+        brake    = max(0.0, -tb)
+        return np.array([steering, gas, brake], dtype=np.float32)
+
     def normalize_observation(self, obs):
         return obs / 255.0
 
@@ -327,9 +348,9 @@ class Agent:
                 with torch.no_grad():
                     obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
                     embed = self.world_model.encode(obs_t).squeeze(1)
-                    action = self.select_action(embed, evaluate=True)
 
-                next_obs, reward, term, trunc, _ = self.env.step(action)
+                actor_action = self.select_action(embed, evaluate=True)
+                next_obs, reward, term, trunc, _ = self.env.step(self.decode_action(actor_action))
                 next_obs = self.process_observation(next_obs)
                 done = term or trunc
                 episode_reward += float(reward)
@@ -343,19 +364,28 @@ class Agent:
         self.actor.train()
         return total_rewards
 
-    def select_action(self, state, evaluate=False, min_gas=0.3):
+    def select_action(self, state, evaluate=False):
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, dtype=torch.float32)
         state = state.float().to(self.device)
         if state.dim() < 2:
             state = state.unsqueeze(0)
-        if evaluate is False:
-            action, _, _ = self.actor.sample(state)
-        else:
+        if evaluate:
             _, _, action = self.actor.sample(state)
-        action = action.detach().cpu().numpy()[0]
-        action[1] = max(action[1], min_gas)  # gas is index 1, floor at min_gas
-        return action
+        else:
+            action, _, _ = self.actor.sample(state)
+        return action.detach().cpu().numpy()[0]
+
+    def warmup_action(self) -> np.ndarray:
+        """Random action with forward bias for warmup exploration.
+
+        Stored in the replay buffer as-is — no post-hoc modification — so
+        the behavior policy matches what gets replayed during AC training.
+        steering ∈ [-1, 1] uniform; throttle_brake ∈ [0, 1] (gas only, no brake).
+        """
+        steering       = np.random.uniform(-1.0, 1.0)
+        throttle_brake = np.random.uniform(0.0, 1.0)
+        return np.array([steering, throttle_brake], dtype=np.float32)
 
     def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5, warmup_episodes=5, run_tag=None):
 
@@ -391,22 +421,25 @@ class Agent:
 
             while not done:
 
-                with torch.no_grad():
-                    obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
-                    embed = self.world_model.encode(obs_t).squeeze(1)  # (1, embed_dim)
-                    gas_floor = 1.0 if episode < warmup_episodes else 0.3
-                    action = self.select_action(embed, min_gas=gas_floor)
+                if episode < warmup_episodes:
+                    actor_action = self.warmup_action()
+                else:
+                    with torch.no_grad():
+                        obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
+                        embed = self.world_model.encode(obs_t).squeeze(1)
+                        actor_action = self.select_action(embed)
 
-                next_obs, reward, term, trunc, _ = self.env.step(action)
+                car_action = self.decode_action(actor_action)
+                next_obs, reward, term, trunc, _ = self.env.step(car_action)
 
-                next_obs = self.process_observation(next_obs)
+                next_obs     = self.process_observation(next_obs)
+                done         = term or trunc
+                episode_done = term or trunc
 
-                done = (term or trunc)
-
-                self.memory.store_transition(obs, action, reward, next_obs, term)
+                self.memory.store_transition(obs, actor_action, reward, next_obs, term, episode_done)
 
                 episode_reward += float(reward)
-                episode_steps += 1
+                episode_steps  += 1
 
                 obs = next_obs
 
