@@ -1,4 +1,5 @@
 import os
+import math
 import subprocess
 import gymnasium as gym
 from gymnasium.spaces import Box
@@ -112,7 +113,8 @@ class Agent:
         self.target_entropy = -self.n_actions
         self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
         self.alpha = self.log_alpha.exp().item()
-        self.alpha_optim = Adam([self.log_alpha], lr=self.critic_lr)
+        self.alpha_min = 0.05
+        self.alpha_optim = Adam([self.log_alpha], lr=3e-5)
 
         self.target_update_interval = target_update_interval
 
@@ -278,6 +280,8 @@ class Agent:
             self.alpha_optim.zero_grad()
             alpha_loss.backward()
             self.alpha_optim.step()
+            with torch.no_grad():
+                self.log_alpha.clamp_(min=math.log(self.alpha_min))
             self.alpha = self.log_alpha.exp().item()
 
             soft_update(self.critic_target, self.critic, self.tau)
