@@ -1,5 +1,8 @@
 import os
+import subprocess
 import gymnasium as gym
+from gymnasium.spaces import Box
+import numpy as np
 import torch
 from buffer import ReplayBuffer
 from utils import hard_update, soft_update, display_stacked_obs
@@ -31,8 +34,7 @@ class MixedSampler:
 
     def _sample_real(self, batch_size, horizon):
         agent = self.agent
-        # Sample batch_size*horizon to match imagined output size
-        obs, actions, rewards, next_obs, dones = agent.memory.sample_buffer(batch_size * horizon)
+        obs, actions, rewards, next_obs, dones = agent.memory.sample_nstep(batch_size * horizon, agent.n_step, agent.gamma)
         with torch.no_grad():
             _, states, _      = agent.world_model.encode(agent.normalize_observation(obs))
             _, next_states, _ = agent.world_model.encode(agent.normalize_observation(next_obs))
@@ -49,11 +51,14 @@ class Agent:
                        max_buffer_size : int = 10000,
                        world_model_batch_size = 8,
                        alpha : float = 0.1,
-                       tau : float = 0.005) -> None:
+                       tau : float = 0.005,
+                       n_step: int = 5) -> None:
         self.env = env
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        self.learning_rate = 0.0001
+        self.critic_lr = 0.0001
+        self.actor_lr = 3e-5
         self.alpha = alpha
+        self.n_step = n_step
 
         os.makedirs("checkpoints", exist_ok=True)
         os.makedirs("runs", exist_ok=True)
@@ -62,8 +67,14 @@ class Agent:
 
         obs = self.process_observation(obs)
 
-        assert self.env.action_space.shape is not None # Gets rid of pyright warnings
-        self.n_actions = self.env.action_space.shape[0] # 3
+        # Actor operates in a structured 2D action space [steering, throttle_brake].
+        # throttle_brake ∈ [-1, 1]: positive → gas, negative → brake.
+        # decode_action() maps this to the 3D CarRacing action before env.step().
+        self.actor_action_space = Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+        )
+        self.n_actions = self.actor_action_space.shape[0]  # 2
         self.ac_hidden_size = 512
 
         self.memory = ReplayBuffer(max_size=max_buffer_size, input_shape=obs.shape, input_device=self.device, output_device=self.device, action_dim=self.n_actions)
@@ -72,7 +83,7 @@ class Agent:
 
         print(f"Observation shape: {obs.shape}")
 
-        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=self.learning_rate)
+        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=self.critic_lr)
 
         self.world_model_batch_size = world_model_batch_size
 
@@ -81,7 +92,7 @@ class Agent:
                              hidden_dim=self.ac_hidden_size, 
                              name=f"critic").to(device=self.device)
 
-        self.critic_optim = Adam(self.critic.parameters(), lr=self.learning_rate)
+        self.critic_optim = Adam(self.critic.parameters(), lr=self.critic_lr)
 
         self.critic_target = Critic(num_inputs=self.world_model.gru_dim, 
                                     num_actions=self.n_actions, 
@@ -90,19 +101,32 @@ class Agent:
         
         hard_update(self.critic_target, self.critic)
 
-        self.actor = Actor(num_inputs=self.world_model.gru_dim, 
-                            num_actions=self.n_actions, 
-                            hidden_dim=self.ac_hidden_size, 
-                            action_space=self.env.action_space, 
+        self.actor = Actor(num_inputs=self.world_model.gru_dim,
+                            num_actions=self.n_actions,
+                            hidden_dim=self.ac_hidden_size,
+                            action_space=self.actor_action_space,
                             name=f"policy").to(self.device)
 
-        self.actor_optim = Adam(self.actor.parameters(), lr=self.learning_rate)
+        self.actor_optim = Adam(self.actor.parameters(), lr=self.actor_lr)
 
         self.gamma = 0.99
         self.tau = tau
 
         self.total_steps = 0
     
+    def decode_action(self, actor_action: np.ndarray) -> np.ndarray:
+        """Map 2D actor action [steering, throttle_brake] to 3D CarRacing action.
+
+        throttle_brake ∈ [-1, 1]: positive values → gas, negative → brake.
+        This eliminates simultaneous gas+brake and keeps the stored action
+        identical to the policy distribution being optimized.
+        """
+        steering = float(actor_action[0])
+        tb       = float(actor_action[1])
+        gas      = max(0.0, tb)
+        brake    = max(0.0, -tb)
+        return np.array([steering, gas, brake], dtype=np.float32)
+
     def normalize_observation(self, obs):
         return obs / 255.0
 
@@ -216,7 +240,7 @@ class Agent:
                 next_state_action, next_state_log_pi, _ = self.actor.sample(next_state_batch)
                 qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, next_state_action)
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
-                next_q_value = reward_batch + (1.0 - mask_batch) * self.gamma * min_qf_next_target
+                next_q_value = reward_batch + (1.0 - mask_batch) * (self.gamma ** self.n_step) * min_qf_next_target
 
             qf1, qf2 = self.critic(state_batch, action_batch)  # Two Q-functions to mitigate positive bias in the policy improvement step
             qf1_loss = F.mse_loss(qf1, next_q_value)  # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
@@ -234,18 +258,23 @@ class Agent:
             qf1_pi, qf2_pi = self.critic(state_batch, pi)
             min_qf_pi = torch.min(qf1_pi, qf2_pi)
 
-            actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean() # Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
+            actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
 
             self.actor_optim.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_optim.step()
 
+
+            alpha_loss = torch.tensor(0.).to(self.device)
+
+            soft_update(self.critic_target, self.critic, self.tau)
+
             total_qf1_loss += qf1_loss.item()
             total_qf2_loss += qf2_loss.item()
             total_actor_loss += actor_loss.item()
 
-        return total_qf1_loss / epochs, total_qf2_loss / epochs, total_actor_loss / epochs
+        return total_qf1_loss / epochs, total_qf2_loss / epochs, total_actor_loss / epochs, 0.0
 
 
 
@@ -314,9 +343,9 @@ class Agent:
                 with torch.no_grad():
                     obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
                     embed, h_t, _ = self.world_model.encode(obs_t)
-                    action = self.select_action(embed, evaluate=True)
 
-                next_obs, reward, term, trunc, _ = self.env.step(action)
+                actor_action = self.select_action(h_t, evaluate=True)
+                next_obs, reward, term, trunc, _ = self.env.step(self.decode_action(actor_action))
                 next_obs = self.process_observation(next_obs)
                 done = term or trunc
                 episode_reward += float(reward)
@@ -336,17 +365,40 @@ class Agent:
         state = state.float().to(self.device)
         if state.dim() < 2:
             state = state.unsqueeze(0)
-        if evaluate is False:
-            action, _, _ = self.actor.sample(state)
-        else:
+        if evaluate:
             _, _, action = self.actor.sample(state)
+        else:
+            action, _, _ = self.actor.sample(state)
         return action.detach().cpu().numpy()[0]
 
-    def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5):
+    def warmup_action(self) -> np.ndarray:
+        """Random action with forward bias for warmup exploration.
+
+        Stored in the replay buffer as-is — no post-hoc modification — so
+        the behavior policy matches what gets replayed during AC training.
+        steering ∈ [-1, 1] uniform; throttle_brake ∈ [0, 1] (gas only, no brake).
+        """
+        steering       = np.random.uniform(-1.0, 1.0)
+        throttle_brake = np.random.uniform(0.0, 1.0)
+        return np.array([steering, throttle_brake], dtype=np.float32)
+
+
+    def train(self, episodes=1, offline_training_epochs=1, batch_size=1, wm_batch_size=1, imagination_steps=None, real_ratio=0.5, warmup_episodes=5, run_tag=None):
 
         rollout_steps = imagination_steps if imagination_steps is not None else batch_size
 
-        run_tag = f'world_model_large_buffer'
+        if run_tag is None:
+            try:
+                run_tag = subprocess.check_output(
+                    ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                    stderr=subprocess.DEVNULL).decode().strip()
+                if run_tag == 'HEAD':
+                    run_tag = subprocess.check_output(
+                        ['git', 'name-rev', '--name-only', 'HEAD'],
+                        stderr=subprocess.DEVNULL).decode().strip()
+                    run_tag = run_tag.replace('remotes/origin/', '').split('~')[0].split('^')[0]
+            except Exception:
+                run_tag = 'unknown'
         summary_writer_name = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{run_tag}'
 
         writer = SummaryWriter(summary_writer_name)
@@ -367,21 +419,25 @@ class Agent:
 
             while not done:
 
-                with torch.no_grad():
-                    obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
-                    embed, h_t, hidden = self.world_model.encode(obs_t, hidden=hidden)  # (1, embed_dim)
-                    action = self.select_action(h_t)
+                if episode < warmup_episodes:
+                    actor_action = self.warmup_action()
+                else:
+                    with torch.no_grad():
+                        obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
+                        embed, h_t, hidden = self.world_model.encode(obs_t, hidden=hidden)
+                        actor_action = self.select_action(h_t)
 
-                next_obs, reward, term, trunc, _ = self.env.step(action)
+                car_action = self.decode_action(actor_action)
+                next_obs, reward, term, trunc, _ = self.env.step(car_action)
 
-                next_obs = self.process_observation(next_obs)
+                next_obs     = self.process_observation(next_obs)
+                done         = term or trunc
+                episode_done = term or trunc
 
-                done = (term or trunc)
-
-                self.memory.store_transition(obs, action, reward, next_obs, done)
+                self.memory.store_transition(obs, actor_action, reward, next_obs, term, episode_done)
 
                 episode_reward += float(reward)
-                episode_steps += 1
+                episode_steps  += 1
 
                 obs = next_obs
 
@@ -405,6 +461,7 @@ class Agent:
             total_qf1_loss = 0.0
             total_qf2_loss = 0.0
             total_actor_loss = 0.0
+            total_alpha_loss = 0.0
             wm_updates = 0
             ac_updates = 0
 
@@ -419,12 +476,14 @@ class Agent:
                     total_dynamics_loss += dynamics_loss
                     wm_updates += 1
 
-                for _ in range(current_ratio[1]):
-                    qf1_loss, qf2_loss, actor_loss = self.train_actor_critic(mixed_sampler, rollout_steps, batch_size, epochs=1)
-                    total_qf1_loss += qf1_loss
-                    total_qf2_loss += qf2_loss
-                    total_actor_loss += actor_loss
-                    ac_updates += 1
+                if episode >= warmup_episodes:
+                    for _ in range(current_ratio[1]):
+                        qf1_loss, qf2_loss, actor_loss, alpha_loss = self.train_actor_critic(mixed_sampler, rollout_steps, batch_size, epochs=1)
+                        total_qf1_loss += qf1_loss
+                        total_qf2_loss += qf2_loss
+                        total_actor_loss += actor_loss
+                        total_alpha_loss += alpha_loss
+                        ac_updates += 1
 
             soft_update(self.critic_target, self.critic, self.tau)
 
