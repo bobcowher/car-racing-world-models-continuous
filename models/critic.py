@@ -11,14 +11,16 @@ class Critic(BaseModel):
 
         # Q1 architecture
         self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
         self.linear2 = nn.Linear(hidden_dim, hidden_dim)
-        self.linear3 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
         self.output1 = nn.Linear(hidden_dim, 1)
 
         # Q2 architecture
         self.linear4 = nn.Linear(num_inputs + num_actions, hidden_dim)
+        self.ln4 = nn.LayerNorm(hidden_dim)
         self.linear5 = nn.Linear(hidden_dim, hidden_dim)
-        self.linear6 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln5 = nn.LayerNorm(hidden_dim)
         self.output2 = nn.Linear(hidden_dim, 1)
 
         self.name = name
@@ -29,15 +31,13 @@ class Critic(BaseModel):
 
     def forward(self, state, action):
         xu = torch.cat([state, action], 1)
-        
-        x1 = F.relu(self.linear1(xu))
-        x1 = F.relu(self.linear2(x1))
-        # x1 = F.relu(self.linear3(x1))
+
+        x1 = F.relu(self.ln1(self.linear1(xu)))
+        x1 = F.relu(self.ln2(self.linear2(x1)))
         x1 = self.output1(x1)
 
-        x2 = F.relu(self.linear4(xu))
-        x2 = F.relu(self.linear5(x2))
-        # x2 = F.relu(self.linear6(x2))
+        x2 = F.relu(self.ln4(self.linear4(xu)))
+        x2 = F.relu(self.ln5(self.linear5(x2)))
         x2 = self.output2(x2)
 
         return x1, x2
