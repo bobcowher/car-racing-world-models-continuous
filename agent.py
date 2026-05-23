@@ -5,7 +5,7 @@ from gymnasium.spaces import Box
 import numpy as np
 import torch
 from buffer import ReplayBuffer
-from utils import hard_update, soft_update, display_stacked_obs
+from utils import hard_update, display_stacked_obs
 from models.world_model import WorldModel
 from models.actor import Actor
 from models.critic import Critic
