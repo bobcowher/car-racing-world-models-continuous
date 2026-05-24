@@ -4,7 +4,7 @@ import gymnasium as gym
 from gymnasium.spaces import Box
 import numpy as np
 import torch
-from buffer import ReplayBuffer
+from buffer import EpisodeReplayBuffer
 from utils import hard_update, display_stacked_obs
 from models.world_model import WorldModel
 from models.actor import Actor
@@ -49,7 +49,8 @@ class Agent:
 
     def __init__(self, env : gym.Env,
                        max_buffer_size : int = 10000,
-                       world_model_batch_size = 8,
+                       world_model_batch_size = 256,
+                       wm_sequence_length : int = 50,
                        target_update_interval = 10000,
                        alpha : float = 0.1,
                        tau : float = 0.005,
@@ -78,7 +79,8 @@ class Agent:
         self.n_actions = self.actor_action_space.shape[0]  # 2
         self.ac_hidden_size = 256
 
-        self.memory = ReplayBuffer(max_size=max_buffer_size, input_shape=obs.shape, input_device=self.device, output_device=self.device, action_dim=self.n_actions)
+        self.wm_sequence_length = wm_sequence_length
+        self.memory = EpisodeReplayBuffer(max_size=max_buffer_size, input_shape=obs.shape, input_device=self.device, output_device=self.device, action_dim=self.n_actions)
 
         self.world_model = WorldModel(observation_shape=obs.shape, embed_dim=1024, n_actions=self.n_actions).to(self.device)
 
@@ -190,7 +192,7 @@ class Agent:
         return states, actions, rewards, next_states, dones
 
     def train_world_model(self, epochs, batch_size):
-        """Train world model with reconstruction + dynamics + prediction losses."""
+        """Train world model on sequences of contiguous transitions."""
 
         total_loss = 0.0
         total_recon = 0.0
@@ -199,9 +201,9 @@ class Agent:
         total_done = 0.0
 
         for _ in range(epochs):
-            obs, actions, rewards, next_obs, dones = self.memory.sample_buffer(batch_size)
+            batch = self.memory.sample_sequences(batch_size, self.wm_sequence_length)
 
-            loss, loss_dict = self.world_model.compute_loss(obs, actions, rewards, next_obs, dones)
+            loss, loss_dict = self.world_model.compute_loss_sequential(batch)
 
             self.world_model_optimizer.zero_grad()
             loss.backward()
@@ -296,9 +298,8 @@ class Agent:
         obs_normalized = obs.float() / 255.0
 
         with torch.no_grad():
-            # Get reconstructions from world model
-            dummy_action = torch.zeros(num_samples, self.n_actions, device=self.device)
-            recon, _, _, _, _ = self.world_model.forward(obs_normalized, dummy_action)
+            embeds, _, _ = self.world_model.encode(obs_normalized)
+            recon = self.world_model.decode(embeds.squeeze(1))
 
         # Prepare visualization pairs
         viz_pairs = []
@@ -477,6 +478,8 @@ class Agent:
             for _ in range(offline_training_epochs):
                 # World model updates
                 for _ in range(current_ratio[0]):
+                    if not self.memory.can_sample_sequences(wm_batch_size, self.wm_sequence_length):
+                        break
                     combined_loss, reward_loss, done_loss, recon_loss, dynamics_loss = self.train_world_model(epochs=1, batch_size=wm_batch_size)
                     total_combined_loss += combined_loss
                     total_reward_loss += reward_loss

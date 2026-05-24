@@ -99,108 +99,76 @@ class WorldModel(BaseModel):
 
         return next_embed, next_h_t, next_hidden_state, reward, done
 
-    def compute_loss(self, obs, actions, rewards, next_obs, dones):
+    def compute_loss_sequential(self, batch: dict):
         """
-        Compute all world model losses.
+        Compute world model losses over sequences of contiguous transitions.
 
         Args:
-            obs: (B, C, H, W) uint8 observations
-            actions: (B,) action indices
-            rewards: (B,) rewards
-            next_obs: (B, C, H, W) uint8 next observations
-            dones: (B,) done flags
+            batch: dict from EpisodeReplayBuffer.sample_sequences() with keys:
+                obs      (N, T, C, H, W) uint8
+                actions  (N, T, n_actions) float32
+                rewards  (N, T) float32
+                dones    (N, T) float32
+
+        The GRU hidden state is initialized to zero at the start of each sequence
+        and flows forward across all T steps. No BPTT across sequence boundaries.
 
         Returns:
-            combined_loss: scalar total loss
-            loss_dict: dictionary of individual losses
+            combined_loss: scalar
+            loss_dict: dict of individual loss values
         """
-        # Normalize observations
-        obs_normalized = obs.float() / 255.0
-        next_obs_normalized = next_obs.float() / 255.0
+        obs = batch["obs"].float() / 255.0   # (N, T, C, H, W)
+        actions = batch["actions"]            # (N, T, n_actions)
+        rewards = batch["rewards"]            # (N, T)
+        dones = batch["dones"]               # (N, T)
 
-        if obs_normalized.ndim == 5:
-            obs_normalized = obs_normalized.squeeze(1)
-        if next_obs_normalized.ndim == 5:
-            next_obs_normalized = next_obs_normalized.squeeze(1)
+        num_sequences, sequence_length = obs.shape[:2]
 
-        # Pass continuous actions directly (already (B, n_actions))
-        action_onehot = actions.float()
+        # Encode full sequences. hidden=None zeros the GRU for each sequence.
+        # embeds:      (N, T, embed_dim)
+        # gru_outputs: (N, T, gru_dim) — hidden state at every timestep
+        embeds, gru_outputs, _ = self.encode(obs)
 
-        # Forward pass
-        recon, _, next_embed_pred, reward_pred, done_pred = self.forward(obs_normalized, action_onehot)
+        # === Reconstruction loss: decode every frame ===
+        embeds_flat = embeds.reshape(num_sequences * sequence_length, -1)
+        obs_flat    = obs.reshape(num_sequences * sequence_length, *obs.shape[2:])
+        recon       = self.decode(embeds_flat)
+        recon_loss  = (F.l1_loss(recon, obs_flat)
+                       + 0.2 * ssim_loss(recon, obs_flat)
+                       + 0.1 * gradient_loss(recon, obs_flat))
 
-        # === 1. Reconstruction Loss ===
-        recon_loss = F.l1_loss(recon, obs_normalized) + 0.2 * ssim_loss(recon, obs_normalized) + 0.1 * gradient_loss(recon, obs_normalized)
+        # === Dynamics loss: embeds[t] + actions[t] → predict embeds[t+1] ===
+        # Covers t=0..T-2 (T-1 prediction pairs per sequence).
+        num_pairs         = num_sequences * (sequence_length - 1)
+        embeds_current    = embeds[:, :-1, :].reshape(num_pairs, -1)
+        actions_current   = actions[:, :-1, :].reshape(num_pairs, -1)
+        next_embed_pred   = self.normalize_embedding(self.dynamics(embeds_current, actions_current))
+        next_embed_target = embeds[:, 1:, :].reshape(num_pairs, -1).detach()
+        dynamics_loss     = F.mse_loss(next_embed_pred, next_embed_target)
 
-        # === 2. Dynamics Loss ===
-        # Encode next observation to get target embedding
-        next_embeds, _, _ = self.encode(next_obs_normalized)  # (B, 1, embed_dim)
-        next_embed_target = next_embeds.view(-1, next_embeds.shape[-1])  # (B, embed_dim)
+        # === Reward and done prediction from (gru_outputs[t], actions[t]) ===
+        gru_outputs_flat = gru_outputs.reshape(num_sequences * sequence_length, -1)
+        actions_flat     = actions.reshape(num_sequences * sequence_length, -1)
+        embed_action     = torch.cat([gru_outputs_flat, actions_flat], dim=-1)
 
-        # MSE between predicted and actual next embedding
-        dynamics_loss = F.mse_loss(next_embed_pred, next_embed_target.detach())
+        reward_pred  = self.reward_pred(embed_action)
+        reward_loss  = F.mse_loss(reward_pred.squeeze(-1), rewards.reshape(num_sequences * sequence_length))
 
-        # === 3. Reward Loss ===
-        reward_loss = F.mse_loss(reward_pred.squeeze(-1), rewards.float())
+        done_pred    = torch.sigmoid(self.done_pred(embed_action))
+        done_loss    = F.binary_cross_entropy(done_pred.squeeze(-1), dones.reshape(num_sequences * sequence_length))
 
-        # === 4. Done Loss ===
-        # Binary classification
-        done_loss = F.binary_cross_entropy(done_pred.squeeze(-1), dones.float())
-
-        # === Combined Loss ===
-        combined_loss = (
-            1.0 * recon_loss +
-            1.0 * dynamics_loss +
-            2.0 * reward_loss +
-            0.5 * done_loss
-        )
+        combined_loss = (1.0 * recon_loss
+                         + 1.0 * dynamics_loss
+                         + 2.0 * reward_loss
+                         + 0.5 * done_loss)
 
         return combined_loss, {
-            "total": combined_loss.item(),
-            "recon": recon_loss.item(),
+            "total":    combined_loss.item(),
+            "recon":    recon_loss.item(),
             "dynamics": dynamics_loss.item(),
-            "reward": reward_loss.item(),
-            "done": done_loss.item(),
+            "reward":   reward_loss.item(),
+            "done":     done_loss.item(),
         }
-
-
-    def forward(self, obs, action_onehot):
-        """
-        Full forward pass through world model.
-
-        Args:
-            obs: (B, C, H, W) observations (uint8 or normalized float)
-            action_onehot: (B, n_actions) one-hot encoded actions
-
-        Returns:
-            recon: (B, C, H, W) reconstructed observation
-            embeds: (B, 1, embed_dim) current state embeddings
-            next_embed_pred: (B, embed_dim) predicted next state embedding
-            reward_pred: (B, 1) predicted reward
-            done_pred: (B, 1) predicted done probability
-        """
-        # Encode observation to latent state
-        embeds, h_t, _ = self.encode(obs)  # (B, 1, embed_dim)
-
-        # Decode for reconstruction
-        embeds_flat = embeds.view(-1, embeds.shape[-1])  # (B, embed_dim)
-        recon = self.decode(embeds_flat)  # (B, C, H, W)
-
-        # Flatten embeddings for predictions
-        embed = embeds_flat  # (B, embed_dim)
-
-        # Predict next embedding using dynamics model and normalize it
-        next_embed_pred = self.dynamics(embed, action_onehot)  # (B, embed_dim)
-        next_embed_pred = self.normalize_embedding(next_embed_pred)
-
-        # Predict reward from current state + action
-        embed_action = torch.cat([h_t, action_onehot], dim=-1)
-        reward_pred = self.reward_pred(embed_action)
-
-        # Predict done from current state + action
-        done_pred = torch.sigmoid(self.done_pred(embed_action))  # (B, 1) in [0, 1]
-
-        return recon, embeds, next_embed_pred, reward_pred, done_pred
     
 
 
