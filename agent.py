@@ -104,7 +104,7 @@ class Agent:
         
         hard_update(self.critic_target, self.critic)
 
-        self.actor = Actor(num_inputs=self.world_model.embed_dim,
+        self.actor = Actor(num_inputs=self.world_model.gru_dim,
                             num_actions=self.n_actions,
                             hidden_dim=self.ac_hidden_size,
                             action_space=self.actor_action_space,
