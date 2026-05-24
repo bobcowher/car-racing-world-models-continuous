@@ -36,8 +36,10 @@ class MixedSampler:
         agent = self.agent
         obs, actions, rewards, next_obs, dones = agent.memory.sample_nstep(batch_size * horizon, agent.n_step, agent.gamma)
         with torch.no_grad():
-            _, states, _      = agent.world_model.encode(agent.normalize_observation(obs))
-            _, next_states, _ = agent.world_model.encode(agent.normalize_observation(next_obs))
+            states, _, _      = agent.world_model.encode(agent.normalize_observation(obs))
+            next_states, _, _ = agent.world_model.encode(agent.normalize_observation(next_obs))
+            states      = states.squeeze(1)
+            next_states = next_states.squeeze(1)
         rewards = rewards.float()
         return states, actions, rewards, next_states, dones
 
@@ -90,21 +92,21 @@ class Agent:
 
         self.world_model_batch_size = world_model_batch_size
 
-        self.critic = Critic(num_inputs=self.world_model.gru_dim,
+        self.critic = Critic(num_inputs=self.world_model.embed_dim,
                              num_actions=self.n_actions, 
                              hidden_dim=self.ac_hidden_size, 
                              name=f"critic").to(device=self.device)
 
         self.critic_optim = Adam(self.critic.parameters(), lr=self.critic_lr)
 
-        self.critic_target = Critic(num_inputs=self.world_model.gru_dim,
+        self.critic_target = Critic(num_inputs=self.world_model.embed_dim,
                                     num_actions=self.n_actions, 
                                     hidden_dim=self.ac_hidden_size, 
                                     name=f"critic_target").to(self.device)
         
         hard_update(self.critic_target, self.critic)
 
-        self.actor = Actor(num_inputs=self.world_model.gru_dim,
+        self.actor = Actor(num_inputs=self.world_model.embed_dim,
                             num_actions=self.n_actions,
                             hidden_dim=self.ac_hidden_size,
                             action_space=self.actor_action_space,
@@ -169,14 +171,14 @@ class Agent:
 
         for _ in range(horizon):
             with torch.no_grad():
-                action, _, _ = self.actor.sample(current_h_t)
+                action, _, _ = self.actor.sample(current_embeds)
 
                 next_embeds, next_h_t, _, rewards, dones = self.world_model.imagine_step(current_embeds, current_h_t, action)
 
-                all_states.append(current_h_t)
+                all_states.append(current_embeds)
                 all_actions.append(action)
                 all_rewards.append(rewards.squeeze(-1))
-                all_next_states.append(next_h_t)
+                all_next_states.append(next_embeds)
                 all_dones.append((dones.squeeze(-1) > 0.5).float())
 
                 current_embeds = next_embeds
@@ -342,14 +344,13 @@ class Agent:
             obs = self.process_observation(obs)
             done = False
             episode_reward = 0.0
-            gru_hidden = None
 
             while not done:
                 with torch.no_grad():
                     obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
-                    _, h_t, gru_hidden = self.world_model.encode(obs_t, gru_hidden)
+                    embed, _, _ = self.world_model.encode(obs_t)
 
-                actor_action = self.select_action(h_t, evaluate=True)
+                actor_action = self.select_action(embed.squeeze(1), evaluate=True)
                 next_obs, reward, term, trunc, _ = self.env.step(self.decode_action(actor_action))
                 next_obs = self.process_observation(next_obs)
                 done = term or trunc
@@ -427,7 +428,6 @@ class Agent:
             episode_reward = 0.0
             episode_loss = 0.0
             episode_steps = 0
-            gru_hidden = None
 
             while not done:
 
@@ -436,8 +436,8 @@ class Agent:
                 else:
                     with torch.no_grad():
                         obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
-                        _, h_t, gru_hidden = self.world_model.encode(obs_t, gru_hidden)
-                        actor_action = self.select_action(h_t)
+                        embed, _, _ = self.world_model.encode(obs_t)
+                        actor_action = self.select_action(embed.squeeze(1))
 
                 car_action = self.decode_action(actor_action)
                 next_obs, reward, term, trunc, _ = self.env.step(car_action)
