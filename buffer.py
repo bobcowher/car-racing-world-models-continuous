@@ -1,5 +1,6 @@
 import torch
 import os
+from collections import deque
 
 class ReplayBuffer:
     def __init__(self, max_size, input_shape,
@@ -131,3 +132,103 @@ class ReplayBuffer:
         total_bytes = sum(t.element_size() * t.numel() for t in tensors)
         print(f"{filled} memories loaded | "
               f"used: {used_bytes / 1e9:.3f} GB / {total_bytes / 1e9:.3f} GB")
+
+
+class EpisodeReplayBuffer(ReplayBuffer):
+    """
+    ReplayBuffer extended with episode boundary tracking for sequence sampling.
+
+    All existing methods (sample_buffer, sample_nstep) work unchanged.
+    sample_sequences() adds GRU/BPTT support — returns contiguous (B, T, ...)
+    tensors from within single episodes, never crossing boundaries.
+
+    No extra obs storage: sequences slice from the existing state_memory /
+    next_state_memory tensors, so memory cost is identical to ReplayBuffer.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Deque of (episode_start, episode_end) absolute indices for completed episodes.
+        # episode_end is exclusive (one past the last stored step).
+        self._episodes: deque[tuple[int, int]] = deque()
+        self._current_episode_start: int = 0
+
+    def store_transition(self, state, action, reward, next_state, terminal, episode_done):
+        super().store_transition(state, action, reward, next_state, terminal, episode_done)
+
+        if episode_done:
+            self._episodes.append((self._current_episode_start, self.mem_ctr))
+            self._current_episode_start = self.mem_ctr
+            # Drop episodes whose start slot has been overwritten by the circular buffer.
+            oldest_valid_index = self.mem_ctr - self.mem_size
+            while self._episodes and self._episodes[0][0] < oldest_valid_index:
+                self._episodes.popleft()
+
+    def can_sample_sequences(self, batch_size: int, sequence_length: int, min_episodes: int = 10) -> bool:
+        num_sequences = batch_size // sequence_length
+        return sum(1 for episode_start, episode_end in self._episodes
+                   if (episode_end - episode_start) >= sequence_length) >= max(min_episodes, num_sequences)
+
+    def sample_sequences(self, batch_size: int, sequence_length: int) -> dict:
+        """
+        Sample contiguous sequences from within single episodes.
+
+        batch_size must be evenly divisible by sequence_length. num_sequences is
+        derived as batch_size // sequence_length so the total number of training
+        samples matches what the rest of the training loop expects.
+
+        Returns dict of (num_sequences, sequence_length, ...) tensors. The temporal
+        dimension is preserved — each of the num_sequences rows is an independent
+        contiguous sequence from a single episode. The GRU processes each row
+        separately; hidden state never crosses sequence boundaries.
+
+            obs      (num_sequences, sequence_length, C, H, W) uint8
+            next_obs (num_sequences, sequence_length, C, H, W) uint8
+            actions  (num_sequences, sequence_length, n_actions) float32
+            rewards  (num_sequences, sequence_length) float32
+            dones    (num_sequences, sequence_length) float32
+        """
+        if batch_size % sequence_length != 0:
+            raise ValueError(
+                f"batch_size ({batch_size}) must be evenly divisible by sequence_length ({sequence_length}). "
+                f"num_sequences is derived as batch_size // sequence_length so that the total number of "
+                f"training samples equals batch_size."
+            )
+
+        num_sequences = batch_size // sequence_length
+
+        valid_episodes = [
+            (episode_start, episode_end)
+            for episode_start, episode_end in self._episodes
+            if (episode_end - episode_start) >= sequence_length
+        ]
+
+        obs_out      = []
+        next_obs_out = []
+        actions_out  = []
+        rewards_out  = []
+        dones_out    = []
+
+        for _ in range(num_sequences):
+            episode_start, episode_end = valid_episodes[int(torch.randint(len(valid_episodes), (1,)).item())]
+            episode_length = episode_end - episode_start
+            window_offset  = int(torch.randint(0, episode_length - sequence_length + 1, (1,)).item())
+            window_start   = episode_start + window_offset
+
+            indices = (torch.arange(sequence_length, dtype=torch.int64) + window_start) % self.mem_size
+            indices = indices.to(self.input_device)
+
+            obs_out.append(self.state_memory[indices])
+            next_obs_out.append(self.next_state_memory[indices])
+            actions_out.append(self.action_memory[indices])
+            rewards_out.append(self.reward_memory[indices])
+            dones_out.append(self.terminal_memory[indices].float())
+
+        output_device = self.output_device
+        return {
+            "obs":      torch.stack(obs_out).to(output_device),        # (num_sequences, sequence_length, C, H, W) — temporal order preserved; GRU processes each row as an independent sequence
+            "next_obs": torch.stack(next_obs_out).to(output_device),   # (num_sequences, sequence_length, C, H, W)
+            "actions":  torch.stack(actions_out).to(output_device),    # (num_sequences, sequence_length, n_actions)
+            "rewards":  torch.stack(rewards_out).to(output_device),    # (num_sequences, sequence_length)
+            "dones":    torch.stack(dones_out).to(output_device),      # (num_sequences, sequence_length)
+        }
