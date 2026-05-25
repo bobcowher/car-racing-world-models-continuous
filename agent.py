@@ -463,6 +463,9 @@ class Agent:
             current_real_ratio = max(real_ratio, 1.0 - episode / 800.0)
             mixed_sampler.real_ratio = current_real_ratio
 
+            # Scale AC epochs with imagination ratio — more imagination = more training
+            adaptive_epochs = int(offline_training_epochs / current_real_ratio)
+
             current_ratio = [2, 2]
 
             total_combined_loss = 0.0
@@ -477,7 +480,7 @@ class Agent:
             wm_updates = 0
             ac_updates = 0
 
-            for _ in range(offline_training_epochs):
+            for _ in range(adaptive_epochs):
                 # World model updates
                 for _ in range(current_ratio[0]):
                     if not self.memory.can_sample_sequences(wm_batch_size, self.wm_sequence_length):
@@ -524,6 +527,7 @@ class Agent:
             writer.add_scalar("Train/episode_reward", episode_reward, episode)
             writer.add_scalar("Train/avg_critic_loss", episode_loss, episode)
             writer.add_scalar("Train/real_ratio", current_real_ratio, episode)
+            writer.add_scalar("Train/adaptive_epochs", adaptive_epochs, episode)
             writer.add_scalar("Train/best_score", best_score, episode)
 
             if episode % 10 == 0:
