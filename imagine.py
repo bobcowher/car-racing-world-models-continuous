@@ -46,7 +46,8 @@ def run_imagination(steps: int = 500, warmup: int = 50, scale: int = 4, out: str
     start_obs = agent.process_observation(obs)
     obs_norm = start_obs.unsqueeze(0).float().to(device) / 255.0
     with torch.no_grad():
-        embed = agent.world_model.encode(obs_norm).squeeze(1)  # (1, embed_dim)
+        embed, current_h_t, _ = agent.world_model.encode(obs_norm)
+        embed = embed.squeeze(1)  # (1, embed_dim)
 
     # Video writer
     frame_size = (96 * scale, 96 * scale)
@@ -86,9 +87,9 @@ def run_imagination(steps: int = 500, warmup: int = 50, scale: int = 4, out: str
                 print("Quit early.")
                 break
 
-            # Imagine next step
+            # Imagine next step — actor uses embed, h_t carried for WM reward/done prediction
             action, _, _ = agent.actor.sample(current_embed)
-            next_embed, reward, done = agent.world_model.imagine_step(current_embed, action)
+            next_embed, current_h_t, _, reward, done = agent.world_model.imagine_step(current_embed, current_h_t, action)
 
             total_reward += reward.item()
             current_embed = next_embed
