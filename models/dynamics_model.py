@@ -47,4 +47,8 @@ class DynamicsModel(BaseModel):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
-        return self.fc_out(x)
+        # Residual prediction: learn the delta, not the absolute next state.
+        # Identity is the default ("do nothing"), so iterating the dynamics in
+        # imagination does not collapse toward a mean-embedding fixed point, and
+        # the action signal must carry the change rather than being ignorable.
+        return embed + self.fc_out(x)
